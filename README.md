@@ -102,6 +102,7 @@ python -m sentinel doctor                # validate the config, show what's avai
 python -m sentinel scan --dry-run        # full scan; the alert is saved to outbox/, not sent
 python -m sentinel test-email            # check SMTP delivery
 python -m sentinel scan                  # the real thing
+python -m sentinel send-alert            # re-send the latest saved alert without re-scanning
 ```
 
 ### Turning on the AI analyst
@@ -156,7 +157,10 @@ export SENTINEL_SMTP_USER="you@gmail.com"                 # PowerShell: setx SEN
 export SENTINEL_SMTP_PASSWORD="your-16-char-app-password"
 ```
 
-with `smtp_host = "smtp.gmail.com"`, `smtp_port = 587`, `security = "starttls"`.
+with `smtp_host = "smtp.gmail.com"`, `smtp_port = 587`, `security = "starttls"`, and
+`from` set to that same Gmail address (Gmail only sends as the account you log in with).
+If a scan ran with `--no-email` or before the login was set up, `sentinel send-alert`
+sends its saved alert afterwards.
 
 An alert contains, per finding: severity, where, redacted evidence, why it matters and
 how to fix it - plus the AI summary, how findings combine, anything the AI dismissed,

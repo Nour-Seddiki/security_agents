@@ -61,7 +61,7 @@ remind_after_days = 7      # re-alert findings that are still open after this lo
 
 [notify.email]
 to = ["admin@example.com"]
-from = "sentinel@example.com"
+from = "sentinel@example.com"   # with Gmail: must be the Gmail address you log in with
 smtp_host = "smtp.gmail.com"
 smtp_port = 587
 security = "starttls"      # starttls (587) | ssl (465) | none

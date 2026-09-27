@@ -116,10 +116,11 @@ class ReportMergeTest(unittest.TestCase):
         major = Finding("web.exposure.git", "Git exposed", Severity.CRITICAL, "web", "https://s")
         minor = Finding("web.headers.csp_missing", "No CSP", Severity.MEDIUM, "web", "https://s")
         result = ScanResult("Shop", "now", findings=[major, minor])
+        leaked = f"ghp_{hexs(36)}"
         report = {
-            "summary": "Summary.",
+            "summary": f"Summary mentioning {leaked}.",
             "verdicts": [
-                {"finding_ids": [major.id], "status": "false_positive", "severity": Severity.INFO, "rationale": "static decoy file", "remediation": ""},
+                {"finding_ids": [major.id], "status": "false_positive", "severity": Severity.INFO, "rationale": f"static decoy file, token {leaked}", "remediation": ""},
                 {"finding_ids": [minor.id, "unknown-id"], "status": "confirmed", "severity": Severity.HIGH, "rationale": "login page", "remediation": "Add a CSP."},
             ],
             "new_findings": [
@@ -139,6 +140,9 @@ class ReportMergeTest(unittest.TestCase):
         added = result.findings[-1]
         self.assertEqual((added.source, added.status), ("agent", "confirmed"))
         self.assertIn("[redacted", added.evidence)
+        # nothing the model writes can carry a secret into a report or email
+        self.assertNotIn(leaked, major.triage_note + outcome.summary)
+        self.assertIn("[redacted", major.triage_note)
 
 
 class RunAgentTest(AgentTestBase):

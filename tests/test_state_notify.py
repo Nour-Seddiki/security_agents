@@ -129,6 +129,24 @@ class EmailTest(unittest.TestCase):
         received = email.message_from_bytes(smtp.box.messages[0]["data"], policy=policy.default)
         self.assertTrue(received["Subject"].startswith("[Sentinel] Test shop"))
 
+    def test_send_alert_resends_the_latest_saved_alert(self):
+        from sentinel.cli import main
+
+        with smtp_server() as smtp:
+            cfg = self.config(smtp.port)
+            msg = build_email(cfg, result_with(finding()), State(self.folder / "s").plan(result_with(finding()), Severity.HIGH, timedelta(days=7), T0), None, T0)
+            run = cfg.reports_dir / "20260901-020000"
+            run.mkdir(parents=True)
+            (run / "alert.eml").write_bytes(msg.as_bytes())
+            os.environ.pop("SENTINEL_TEST_SMTP_USER", None)
+            with mock.patch("sys.stdout"):
+                code = main(["send-alert", "-c", str(cfg.path)])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(smtp.box.messages), 1)
+        received = email.message_from_bytes(smtp.box.messages[0]["data"], policy=policy.default)
+        self.assertEqual(received["To"], "admin@shop.example")
+        self.assertEqual(received["From"], "sentinel@shop.example")
+
     def test_rejected_recipient_raises(self):
         with smtp_server(reject_rcpt=True) as smtp:
             cfg = self.config(smtp.port)

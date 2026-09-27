@@ -576,10 +576,12 @@ def apply_report(result: ScanResult, report: dict, min_severity: Severity, outco
                 continue
             was_major = finding.status != "false_positive" and finding.severity >= min_severity
             finding.status = verdict["status"]
-            note = f"AI triage ({verdict['status'].replace('_', ' ')}): {verdict['rationale']}".strip()
+            # Everything the model writes is redacted too: it must never quote a secret
+            # into a report or an email, even one it should not have been able to see.
+            note = f"AI triage ({verdict['status'].replace('_', ' ')}): {redact(verdict['rationale'])}".strip()
             finding.reassess(verdict["severity"], note, by="agent")
             if verdict["remediation"]:
-                finding.remediation = verdict["remediation"]
+                finding.remediation = redact(verdict["remediation"])
             outcome.verdicts_applied += 1
             now_major = finding.status != "false_positive" and finding.severity >= min_severity
             if was_major and not now_major and finding.source == "scanner":
@@ -587,14 +589,14 @@ def apply_report(result: ScanResult, report: dict, min_severity: Severity, outco
     for item in report["new_findings"]:
         finding = Finding(
             check_id="agent.investigation.finding",
-            title=item["title"][:200],
+            title=redact(item["title"])[:200],
             severity=item["severity"],
             category=item["category"],
             target=item["target"][:300] or result.platform,
             location=item["location"][:300],
             evidence=redact(item["evidence"])[:800],
-            description=item["description"][:1500],
-            remediation=item["remediation"][:1500],
+            description=redact(item["description"])[:1500],
+            remediation=redact(item["remediation"])[:1500],
             source="agent",
             status="confirmed",
             triaged_by="agent",
@@ -603,8 +605,8 @@ def apply_report(result: ScanResult, report: dict, min_severity: Severity, outco
             result.findings.append(finding)
             by_id[finding.id] = finding
             outcome.new_findings += 1
-    outcome.summary = report["summary"]
-    outcome.risk_chains = report["risk_chains"]
+    outcome.summary = redact(report["summary"])
+    outcome.risk_chains = [redact(chain) for chain in report["risk_chains"]]
 
 
 def _drive(runner, outcome: AgentOutcome, max_turns: int, max_tokens: int, say: Callable[[str], None]):

@@ -153,6 +153,43 @@ def cmd_test_email(args) -> int:
     return 0
 
 
+def cmd_send_alert(args) -> int:
+    """Send a saved alert (by default the latest run's alert.eml) with the configured SMTP
+    settings - e.g. after setting up the SMTP login, without re-running the scan."""
+    import email
+    from email import policy
+
+    from .notify import NotifyError, send_email
+
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        _say(f"config error: {exc}")
+        return EXIT_USAGE
+    if config.notify.email is None:
+        _say("no [notify.email] section in the config")
+        return EXIT_USAGE
+    if args.eml:
+        path = Path(args.eml)
+    else:
+        saved = sorted(config.reports_dir.glob("*/alert.eml"))
+        if not saved:
+            _say(f"no saved alert found under {config.reports_dir}")
+            return EXIT_USAGE
+        path = saved[-1]
+    msg = email.message_from_bytes(path.read_bytes(), policy=policy.default)
+    for header, value in (("From", config.notify.email.sender), ("To", ", ".join(config.notify.email.to))):
+        del msg[header]
+        msg[header] = value
+    try:
+        send_email(msg, config.notify.email)
+    except NotifyError as exc:
+        _say(f"FAILED: {exc}")
+        return 3
+    _say(f"sent {path} to {', '.join(config.notify.email.to)}: {msg['Subject']}")
+    return 0
+
+
 def cmd_demo(args) -> int:
     from .demo import LocalSite, build_sample_repo, make_vulnerable_handler, write_demo_config
 
@@ -194,6 +231,11 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("-c", "--config", default="sentinel.toml")
     test.add_argument("--dry-run", action="store_true", help="write the test message to the outbox instead")
     test.set_defaults(func=cmd_test_email)
+
+    resend = sub.add_parser("send-alert", help="send a saved alert (default: the latest run's) without re-scanning")
+    resend.add_argument("-c", "--config", default="sentinel.toml")
+    resend.add_argument("--eml", help="path of a saved .eml alert (default: reports/<latest>/alert.eml)")
+    resend.set_defaults(func=cmd_send_alert)
 
     demo = sub.add_parser("demo", help="scan a deliberately vulnerable local site and sample repo")
     demo.add_argument("--out", help="folder for the demo files (default: <temp>/sentinel-demo)")

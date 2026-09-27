@@ -254,9 +254,9 @@ def mask(value: str) -> str:
     return "[redacted]"
 
 
-def _mask_group(match: re.Match[str], group: int) -> str:
+def _mask_group(match: re.Match[str], group: int, force: bool = False) -> str:
     value = match.group(group)
-    if value is None or "[redacted" in value or is_placeholder(value):
+    if value is None or "[redacted" in value or (is_placeholder(value) and not force):
         return match.group(0)
     whole = match.group(0)
     start = match.start(group) - match.start(0)
@@ -272,7 +272,9 @@ def redact(text: str) -> str:
     for rule in SECRET_RULES:
         if rule.name == "private_key":
             continue
-        text = rule.pattern.sub(lambda m, g=rule.group: _mask_group(m, g), text)
+        # A fallback default is masked even when it reads like "change-me": it is the key
+        # the service really uses whenever the variable is missing.
+        text = rule.pattern.sub(lambda m, g=rule.group, f=rule.flag_placeholders: _mask_group(m, g, f), text)
     text = _ENV_ASSIGNMENT.sub(lambda m: _mask_group(m, 2), text)
     text = _AUTH_HEADER.sub(lambda m: _mask_group(m, 2), text)
     return text

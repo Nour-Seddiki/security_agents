@@ -70,6 +70,13 @@ class RedactTest(unittest.TestCase):
         self.assertTrue(is_placeholder(AWS_DOCS_EXAMPLE_KEY))
         self.assertFalse(is_placeholder(hexs(24)))
 
+    def test_fallback_defaults_are_masked_even_when_they_look_like_placeholders(self):
+        default = "dev-" + "insecure-secret-change-me"
+        cleaned = redact(f'secret_key = os.getenv("SECRET_KEY", "{default}")')
+        self.assertNotIn(default, cleaned)
+        self.assertIn("[redacted 29 chars]", cleaned)
+        self.assertIn('password = "changeme"', redact('password = "changeme"'))  # ordinary placeholders stay
+
     def test_mask(self):
         self.assertEqual(mask("short"), "[redacted]")
         self.assertTrue(mask("sk_live_" + "a1" * 12).startswith("sk_l...[redacted 32 chars]"))
