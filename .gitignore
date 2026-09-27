@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+sentinel.toml
+reports/
+state/
+outbox/
+.env

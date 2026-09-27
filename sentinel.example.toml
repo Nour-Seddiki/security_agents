@@ -1,0 +1,62 @@
+# Sentinel configuration. Copy to sentinel.toml and edit.
+# Relative paths are resolved from this file's folder. Unknown keys are errors.
+
+[platform]
+name = "Acme Shop"
+# Required before any scan runs: confirms you own every target below, or have
+# written permission to test it. Sentinel only reads (GET requests, file reads),
+# but scanning systems you don't own is still off-limits.
+authorized = false
+
+[web]
+# Pages to assess. Origin-level checks (TLS, exposed files, security.txt) run once
+# per origin; header, cookie and CORS checks run per URL.
+urls = ["https://shop.example.com/", "https://shop.example.com/login"]
+# Extra hosts that redirects may land on (e.g. the www. variant).
+extra_hosts = []
+max_requests = 300        # hard cap on scanner HTTP requests per run
+request_delay_ms = 150    # politeness delay between requests to the same host
+timeout_s = 10
+
+[code]
+# The platform's source repositories. In a git checkout only committed or
+# committable files are read (.gitignore is honoured).
+repos = ["../shop-backend", "../shop-frontend"]
+exclude = ["migrations", "*.min.js"]
+max_file_kb = 1024
+
+[deps]
+# Package names and versions (never code) are sent to the OSV.dev database.
+enabled = true
+osv_api = "https://api.osv.dev"
+max_advisory_lookups = 200
+
+[agent]
+# AI triage with Claude. Needs `pip install anthropic` and ANTHROPIC_API_KEY
+# (or an `ant auth login` profile). Without them the scan still runs and alerts
+# on the scanners' own severities.
+enabled = true
+model = "claude-opus-5"
+effort = "high"            # low | medium | high | xhigh | max
+max_turns = 30
+max_http_requests = 40     # the agent's own GET budget, separate from the scanners'
+
+[notify]
+min_severity = "high"      # "major" = this severity and above
+remind_after_days = 7      # re-alert findings that are still open after this long
+
+[notify.email]
+to = ["admin@example.com"]
+from = "sentinel@example.com"
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+security = "starttls"      # starttls (587) | ssl (465) | none
+# Names of the environment variables that hold the SMTP login - never the values.
+username_env = "SENTINEL_SMTP_USER"
+password_env = "SENTINEL_SMTP_PASSWORD"
+subject_prefix = "[Sentinel]"
+
+[output]
+reports_dir = "reports"
+state_file = "state/sentinel-state.json"
+outbox_dir = "outbox"

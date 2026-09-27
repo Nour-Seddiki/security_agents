@@ -1,0 +1,2 @@
+# Only the AI triage step needs a third-party package; scanners, alerts and tests are stdlib.
+anthropic>=1.0
