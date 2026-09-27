@@ -104,6 +104,39 @@ def _git_files(root: Path) -> list[str] | None:
     return list(dict.fromkeys(tracked + others))
 
 
+def sync_checkout(url: str, dest: Path, timeout: float = 300.0) -> str:
+    """Shallow-clone `url` into `dest`, or bring an existing checkout up to date.
+
+    Prompts are disabled so a scheduled run fails fast on a private repository without
+    credentials, and Git LFS content is not downloaded.
+    """
+    git = shutil.which("git")
+    if not git:
+        raise OSError("git is not installed, so remote repositories can't be fetched")
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
+
+    def run(*args: str) -> None:
+        try:
+            proc = subprocess.run(
+                [git, "-c", "core.fsmonitor=false", *args], capture_output=True, text=True, timeout=timeout, env=env
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError(f"git {args[0] if args[0] != '-C' else args[2]} timed out after {timeout:.0f}s") from exc
+        if proc.returncode != 0:
+            lines = [ln for ln in (proc.stderr or proc.stdout).strip().splitlines() if ln.strip()]
+            raise OSError(lines[-1] if lines else f"git exited with status {proc.returncode}")
+
+    if (dest / ".git").exists():
+        run("-C", str(dest), "fetch", "--depth", "1", "--quiet", "origin", "HEAD")
+        run("-C", str(dest), "reset", "--hard", "--quiet", "FETCH_HEAD")
+        return "updated"
+    if dest.exists() and any(dest.iterdir()):
+        raise OSError(f"{dest} exists but is not a git checkout")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    run("clone", "--depth", "1", "--quiet", "--", url, str(dest))
+    return "cloned"
+
+
 def _walk_files(root: Path) -> list[str]:
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -120,6 +153,7 @@ def list_repo_files(label: str, root: Path, exclude: list[str] | tuple = (), max
     if rels is None:
         rels, mode = _walk_files(root), "walk"
     keep, skipped_large = [], 0
+    real_root = root.resolve()
     for rel in rels:
         parts = rel.split("/")
         if any(p in SKIP_DIRS for p in parts[:-1]):
@@ -132,6 +166,8 @@ def list_repo_files(label: str, root: Path, exclude: list[str] | tuple = (), max
         try:
             if not path.is_file():
                 continue  # tracked but deleted from the working tree
+            if real_root not in path.resolve().parents:
+                continue  # a symlink out of the repository: never read what it points at
             size = path.stat().st_size
         except OSError:
             continue
@@ -162,7 +198,7 @@ def find_secrets(label: str, rel: str, text: str) -> list[Finding]:
         for m in rule.pattern.finditer(text):
             value = m.group(rule.group)
             if rule.name != "private_key":
-                if is_placeholder(value):
+                if is_placeholder(value) and not (rule.flag_placeholders and value.strip()):
                     continue
                 if rule.name == "generic_secret" and not looks_like_secret(value):
                     continue
@@ -193,9 +229,11 @@ def find_secrets(label: str, rel: str, text: str) -> list[Finding]:
                 target=label,
                 location=f"{rel}:{lineno}",
                 evidence=evidence,
-                description="Anyone who can read this repository - or any clone, fork, CI log "
+                description=rule.description
+                or "Anyone who can read this repository - or any clone, fork, CI log "
                 "or backup of it, and its whole git history - can use this credential.",
-                remediation="Revoke or rotate the credential now, load it from the environment or "
+                remediation=rule.remediation
+                or "Revoke or rotate the credential now, load it from the environment or "
                 "a secret manager instead, and purge it from git history (git filter-repo) if "
                 "the repository was ever shared.",
                 references=[OWASP_SECRETS],
@@ -291,10 +329,6 @@ PY_RULES: dict[str, CodeRule] = {
         "Use tempfile.mkstemp() or NamedTemporaryFile().",
     ),
 }
-
-# Rules whose one issue is usually written over adjacent lines (ctx.check_hostname = False
-# followed by ctx.verify_mode = CERT_NONE): report those once per block.
-SPREAD_RULES = {"tls_verify_off"}
 
 SQL_WORDS = re.compile(r"(?i)\b(select|insert|update|delete|create|drop|alter|where|values|into)\b")
 SQL_SINKS = {"execute", "executemany", "executescript", "raw", "text", "read_sql", "read_sql_query", "extra"}
@@ -444,30 +478,35 @@ def analyze_python(label: str, rel: str, text: str) -> list[Finding]:
 
 
 def _code_findings(label, rel, text, hits, family, rules) -> list[Finding]:
+    """One finding per rule per file, listing every line: the file is the unit someone
+    fixes, and 50 separate alerts for one pattern in one file help nobody."""
     lines = text.splitlines()
-    out, counts = [], {}
-    last_line: dict[str, int] = {}
-    for rule_name, lineno in sorted(hits, key=lambda h: h[1]):
-        previous = last_line.get(rule_name)
-        last_line[rule_name] = lineno
-        if previous is not None and (lineno == previous or (rule_name in SPREAD_RULES and lineno - previous <= 3)):
-            continue
+    by_rule: dict[str, list[int]] = {}
+    for rule_name, lineno in hits:
+        found = by_rule.setdefault(rule_name, [])
+        if lineno not in found:
+            found.append(lineno)
+    out = []
+    for rule_name, linenos in sorted(by_rule.items(), key=lambda item: min(item[1])):
+        linenos.sort()
         rule = rules[rule_name]
-        n = counts.get(rule_name, 0)
-        counts[rule_name] = n + 1
-        line = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+        first = linenos[0]
+        evidence = _evidence(rel, first, lines[first - 1] if 0 < first <= len(lines) else "")
+        if len(linenos) > 1:
+            shown = ", ".join(str(n) for n in linenos[1:15]) + (", ..." if len(linenos) > 15 else "")
+            evidence += f"  (also lines {shown})"
         out.append(
             Finding(
                 check_id=f"code.{family}.{rule_name}",
-                title=rule.title,
+                title=rule.title + (f" ({len(linenos)} places)" if len(linenos) > 1 else ""),
                 severity=rule.severity,
                 category="code",
                 target=label,
-                location=f"{rel}:{lineno}",
-                evidence=_evidence(rel, lineno, line),
+                location=f"{rel}:{first}",
+                evidence=evidence,
                 description=rule.description,
                 remediation=rule.remediation,
-                key=f"{rel}:{rule_name}:{n}",
+                key=f"{rel}:{rule_name}",
                 confidence="tentative",
             )
         )
@@ -528,10 +567,25 @@ JS_RULES: dict[str, RegexRule] = {
         "Allowing alg=none lets anyone forge tokens without a key.",
         "Pin the expected algorithm (e.g. algorithms: ['RS256']).",
     ),
+    "inline_handler_string": RegexRule(
+        "Value interpolated into a string inside an inline event handler", Severity.MEDIUM,
+        re.compile(r"""\bon[a-z]+\s*=\s*(?:"[^"\n]*'\$\{|'[^'\n]*"\$\{)"""),
+        "Browsers decode HTML entities in an attribute before running the handler, so escapeHtml() "
+        "does not protect a value placed inside a JavaScript string in onclick=\"...\": the handler "
+        "receives the raw text, and a value like x');alert(1);// - or HTML that the handler later "
+        "writes into the page - runs as code when the element is clicked.",
+        "Pass only numeric ids to inline handlers and look the rest up in JavaScript, or attach "
+        "handlers with addEventListener and read values from data- attributes.",
+    ),
     "dom_xss": RegexRule(
         "HTML sink fed with dynamic content", Severity.LOW,
         re.compile(
-            r"dangerouslySetInnerHTML|\.(?:innerHTML|outerHTML)\s*=(?!=)(?!\s*[\"'][^\"'\n]*[\"']\s*;?\s*$)|document\.write\s*\(",
+            # Skip assignments of a complete string literal (quotes inside are fine) or a
+            # template with no ${...}: static markup can't carry user input.
+            r"dangerouslySetInnerHTML"
+            r"|\.(?:innerHTML|outerHTML)\s*=(?!=)"
+            r"(?!\s*(?:'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\"|`[^`$]*`)\s*(?:;|$|//|\}))"
+            r"|document\.write\s*\(",
             re.M,
         ),
         "Writing unescaped strings into the DOM is cross-site scripting when they contain user input.",

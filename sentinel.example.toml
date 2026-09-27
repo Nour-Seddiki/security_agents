@@ -10,7 +10,8 @@ authorized = false
 
 [web]
 # Pages to assess. Origin-level checks (TLS, exposed files, security.txt) run once
-# per origin; header, cookie and CORS checks run per URL.
+# per origin; header, cookie and CORS checks run per URL. Anything after # (hash
+# routes like /#/signin) never reaches the server and is dropped.
 urls = ["https://shop.example.com/", "https://shop.example.com/login"]
 # Extra hosts that redirects may land on (e.g. the www. variant).
 extra_hosts = []
@@ -19,11 +20,15 @@ request_delay_ms = 150    # politeness delay between requests to the same host
 timeout_s = 10
 
 [code]
-# The platform's source repositories. In a git checkout only committed or
+# The platform's source code: local folders and/or git URLs. Git URLs are
+# shallow-cloned, and refreshed on every run, into checkout_dir (default:
+# %LOCALAPPDATA%\sentinel\repos). Private repos use git's credential manager or
+# SSH key - never put a token in the URL. In a git checkout only committed or
 # committable files are read (.gitignore is honoured).
-repos = ["../shop-backend", "../shop-frontend"]
+repos = ["../shop-backend", "https://github.com/acme/shop-frontend"]
 exclude = ["migrations", "*.min.js"]
 max_file_kb = 1024
+# checkout_dir = "D:/sentinel-repos"
 
 [deps]
 # Package names and versions (never code) are sent to the OSV.dev database.
@@ -32,14 +37,23 @@ osv_api = "https://api.osv.dev"
 max_advisory_lookups = 200
 
 [agent]
-# AI triage with Claude. Needs `pip install anthropic` and ANTHROPIC_API_KEY
-# (or an `ant auth login` profile). Without them the scan still runs and alerts
-# on the scanners' own severities.
+# AI triage with Claude. Two backends:
+#   "api"         - the Anthropic API: `pip install anthropic` + ANTHROPIC_API_KEY
+#                   (pay-as-you-go credits). The agent can also re-fetch in-scope pages.
+#   "claude-code" - the `claude` CLI with your own Claude login (Pro/Max plan): no API
+#                   key; read-only file tools over a redacted copy of the code.
+# Without either, the scan still runs and alerts on the scanners' own severities.
 enabled = true
-model = "claude-opus-5"
+backend = "api"
 effort = "high"            # low | medium | high | xhigh | max
+# api backend
+model = "claude-opus-5"
 max_turns = 30
 max_http_requests = 40     # the agent's own GET budget, separate from the scanners'
+# claude-code backend
+# claude_code_path = ""    # default: `claude` on PATH
+# claude_code_model = ""   # e.g. "opus" or "sonnet"; default: the CLI's own default
+timeout_s = 1800
 
 [notify]
 min_severity = "high"      # "major" = this severity and above

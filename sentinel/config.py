@@ -7,16 +7,21 @@ what gets reported.
 
 from __future__ import annotations
 
+import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .models import Severity
 from .scope import ScopeError, origin_of
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+AGENT_BACKENDS = ("api", "claude-code")
 SMTP_SECURITY = ("starttls", "ssl", "none")
+REMOTE_REPO = re.compile(r"^(?:https?://|ssh://|git@[\w.-]+:)", re.I)
+WEB_GIT_HOSTS = ("github.com", "gitlab.com", "bitbucket.org")
 
 
 class ConfigError(ValueError):
@@ -35,9 +40,10 @@ class WebConfig:
 
 @dataclass
 class CodeConfig:
-    repos: list[Path] = field(default_factory=list)
+    repos: list[Path] = field(default_factory=list)  # local folders (remote ones: their checkout)
     exclude: list[str] = field(default_factory=list)
     max_file_kb: int = 1024
+    remotes: dict[Path, str] = field(default_factory=dict)  # checkout folder -> git URL
 
 
 @dataclass
@@ -51,12 +57,16 @@ class DepsConfig:
 @dataclass
 class AgentConfig:
     enabled: bool = True
+    backend: str = "api"  # "api" (Anthropic API key) or "claude-code" (the claude CLI and your Claude login)
     model: str = "claude-opus-5"
     effort: str = "high"
     thinking: bool = True
     max_tokens: int = 16000
     max_turns: int = 30
     max_http_requests: int = 40
+    claude_code_path: str = ""  # default: `claude` on PATH
+    claude_code_model: str = ""  # e.g. "opus" or "sonnet"; default: the CLI's own default
+    timeout_s: float = 1800.0  # claude-code backend: the whole analysis
 
 
 @dataclass
@@ -91,6 +101,7 @@ class Config:
     reports_dir: Path
     state_file: Path
     outbox_dir: Path
+    notes: list[str] = field(default_factory=list)  # adjustments made while loading
 
 
 class _Table:
@@ -162,14 +173,49 @@ class _Table:
             raise ConfigError(f"[{self.where}] unknown key(s): {', '.join(extra)}")
 
 
-def _check_url(url: str, where: str) -> str:
+def _normalize_url(url: str, where: str, notes: list[str]) -> str:
+    """Validate a URL and put it in canonical form. A #fragment (hash routing such as
+    /#/signin) never reaches the server, so it is dropped rather than rejected."""
     try:
         origin_of(url)
     except ScopeError as exc:
         raise ConfigError(f"[{where}] {exc}") from None
-    if urlsplit(url).fragment:
-        raise ConfigError(f"[{where}] URLs must not contain a #fragment: {url}")
-    return url
+    parts = urlsplit(url)
+    if parts.fragment:
+        notes.append(f"{url}: dropped '#{parts.fragment}' - the part after # is handled in the browser and never sent to the server")
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", parts.query, ""))
+
+
+def default_checkout_dir() -> Path:
+    """Remote repositories are cloned here: outside the project (and outside OneDrive)."""
+    base = os.environ.get("LOCALAPPDATA")
+    return (Path(base) if base else Path.home() / ".cache") / "sentinel" / "repos"
+
+
+def remote_repo(entry: str, checkout_dir: Path) -> tuple[str, Path]:
+    """(clone URL, local checkout folder) for a git URL from [code] repos."""
+    if entry.lower().startswith("git@"):
+        host, _, path = entry[4:].partition(":")
+    else:
+        parts = urlsplit(entry)
+        if parts.username or parts.password:
+            raise ConfigError(
+                "[code] don't put credentials in a repository URL; git's credential manager "
+                "(or an SSH key) handles private repositories"
+            )
+        host, path = parts.hostname or "", parts.path
+    segments = [s for s in path.strip("/").split("/") if s]
+    if not host or not segments:
+        raise ConfigError(f"[code] not a repository URL: {entry}")
+    segments[-1] = segments[-1].removesuffix(".git")
+    url = entry
+    if host.lower() in WEB_GIT_HOSTS and not entry.lower().startswith("git@"):
+        if len(segments) < 2:
+            raise ConfigError(f"[code] expected {host}/<owner>/<repo>: {entry}")
+        segments = segments[:2]  # drop /tree/main/... from a copied browser URL
+        url = f"https://{host.lower()}/{segments[0]}/{segments[1]}"
+    safe = [re.sub(r"[^\w.-]", "_", s) for s in [host.lower(), *segments]]
+    return url, checkout_dir.joinpath(*safe).resolve()
 
 
 def _email(data, where: str) -> EmailConfig | None:
@@ -212,6 +258,7 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError(f"{path}: {exc}") from None
     base = path.resolve().parent
     root = _Table(data, "top level")
+    notes: list[str] = []
 
     t = _Table(root.table("platform"), "platform")
     platform = t.str("name", required=True)
@@ -219,8 +266,13 @@ def load_config(path: str | Path) -> Config:
     t.done()
 
     t = _Table(root.table("web"), "web")
+    urls: list[str] = []
+    for raw in t.str_list("urls"):
+        url = _normalize_url(raw, "web", notes)
+        if url not in urls:  # "https://x" and "https://x/" are the same page
+            urls.append(url)
     web = WebConfig(
-        urls=[_check_url(u, "web") for u in t.str_list("urls")],
+        urls=urls,
         extra_hosts=t.str_list("extra_hosts"),
         max_requests=t.int("max_requests", 300, 1, 100_000),
         request_delay_ms=t.int("request_delay_ms", 150, 0, 60_000),
@@ -230,18 +282,31 @@ def load_config(path: str | Path) -> Config:
     t.done()
 
     t = _Table(root.table("code"), "code")
-    repos = []
+    checkout_value = t.str("checkout_dir", "")
+    checkout_dir = Path(checkout_value) if checkout_value else default_checkout_dir()
+    if not checkout_dir.is_absolute():
+        checkout_dir = base / checkout_dir
+    repos: list[Path] = []
+    remotes: dict[Path, str] = {}
     for entry in t.str_list("repos"):
-        repo = Path(entry)
-        repo = repo if repo.is_absolute() else (base / repo)
-        repo = repo.resolve()
-        if not repo.is_dir():
-            raise ConfigError(f"[code] repository not found: {repo}")
-        repos.append(repo)
+        if REMOTE_REPO.match(entry):
+            url, repo = remote_repo(entry, checkout_dir)
+            remotes[repo] = url
+        else:
+            repo = Path(entry)
+            repo = (repo if repo.is_absolute() else (base / repo)).resolve()
+            if not repo.is_dir():
+                raise ConfigError(
+                    f"[code] repository not found: {repo}\n"
+                    "  use a local folder, or a git URL such as https://github.com/<owner>/<repo>"
+                )
+        if repo not in repos:
+            repos.append(repo)
     code = CodeConfig(
         repos=repos,
         exclude=t.str_list("exclude"),
         max_file_kb=t.int("max_file_kb", 1024, 1, 1_000_000),
+        remotes=remotes,
     )
     t.done()
 
@@ -259,16 +324,22 @@ def load_config(path: str | Path) -> Config:
     t = _Table(root.table("agent"), "agent")
     agent = AgentConfig(
         enabled=t.bool("enabled", True),
+        backend=t.str("backend", "api").lower(),
         model=t.str("model", "claude-opus-5") or "claude-opus-5",
         effort=t.str("effort", "high").lower(),
         thinking=t.bool("thinking", True),
         max_tokens=t.int("max_tokens", 16000, 1024, 21000),
         max_turns=t.int("max_turns", 30, 1, 200),
         max_http_requests=t.int("max_http_requests", 40, 0, 1000),
+        claude_code_path=t.str("claude_code_path", ""),
+        claude_code_model=t.str("claude_code_model", ""),
+        timeout_s=t.float("timeout_s", 1800.0, 30.0),
     )
     t.done()
     if agent.effort not in EFFORTS:
         raise ConfigError(f"[agent] effort must be one of {', '.join(EFFORTS)}")
+    if agent.backend not in AGENT_BACKENDS:
+        raise ConfigError(f"[agent] backend must be one of {', '.join(AGENT_BACKENDS)}")
 
     t = _Table(root.table("notify"), "notify")
     try:
@@ -309,4 +380,5 @@ def load_config(path: str | Path) -> Config:
         reports_dir=reports_dir,
         state_file=state_file,
         outbox_dir=outbox_dir,
+        notes=notes,
     )

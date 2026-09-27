@@ -707,6 +707,12 @@ def check_exposure(http: HttpClient, origin_url: str) -> list[Finding]:
         return found
 
     failures: list[str] = []
+    checked: list[str] = []
+
+    def progress() -> str:
+        exposed = sum(len(m) for m in hits.values())
+        return f"checked {len(checked)} of {len(PROBES)} paths ({exposed} exposed) before stopping"
+
     for probe in PROBES:
         url = base + probe.path
         try:
@@ -714,10 +720,11 @@ def check_exposure(http: HttpClient, origin_url: str) -> list[Finding]:
         except FetchError as exc:
             failures.append(str(exc))
             if len(failures) > 3:
-                raise CheckIncomplete(f"{len(failures)} probe requests failed; last: {exc}", collect()) from exc
+                raise CheckIncomplete(f"{progress()}; {len(failures)} requests failed, last: {exc}", collect()) from exc
             continue
         except Exception as exc:  # budget spent or scope problem: keep what we have
-            raise CheckIncomplete(f"stopped early: {exc}", collect()) from exc
+            raise CheckIncomplete(f"{progress()}: {exc}", collect()) from exc
+        checked.append(probe.path)
         if resp.status != 200 or not resp.body:
             continue
         if soft_404 and hashlib.sha256(resp.body).digest() == baseline_hash:
@@ -725,7 +732,7 @@ def check_exposure(http: HttpClient, origin_url: str) -> list[Finding]:
         if probe.matches(resp.body):
             hits.setdefault(probe.rule, []).append((probe, url, redact(probe.describe(resp.body))))
     if failures:
-        raise CheckIncomplete(f"{len(failures)} probe request(s) failed; last: {failures[-1]}", collect())
+        raise CheckIncomplete(f"{progress()}; {len(failures)} request(s) failed, last: {failures[-1]}", collect())
     return collect()
 
 

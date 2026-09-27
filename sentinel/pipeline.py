@@ -16,8 +16,17 @@ from pathlib import Path
 from typing import Callable
 
 from .agent import run_agent
+from .agent_cli import run_claude_code_agent
 from .checks import run_check
-from .checks.code import RepoFiles, list_repo_files, scan_config, scan_javascript, scan_python, scan_secrets
+from .checks.code import (
+    RepoFiles,
+    list_repo_files,
+    scan_config,
+    scan_javascript,
+    scan_python,
+    scan_secrets,
+    sync_checkout,
+)
 from .checks.deps import OsvClient, scan_dependencies
 from .checks.tls import check_tls_cert, check_tls_protocols
 from .checks.web import check_cookies, check_cors, check_exposure, check_headers, check_security_txt, check_transport
@@ -92,19 +101,29 @@ def scan_web(config: Config, http: HttpClient, result: ScanResult, say: Callable
         run_check(result, "web.securitytxt", origin_url, check_security_txt, http, origin_url)
 
 
-def _repo_files(config: Config, label: str, root: Path, repos: dict[str, RepoFiles]) -> RepoFiles:
-    if label not in repos:
-        repos[label] = list_repo_files(label, root, config.code.exclude, config.code.max_file_kb * 1024)
+def _repo_files(config: Config, label: str, root: Path, repos: dict[str, RepoFiles], result: ScanResult, say) -> RepoFiles:
+    if label in repos:
+        return repos[label]
+    url = config.code.remotes.get(root)
+    if url:
+        try:
+            status = sync_checkout(url, root)
+            say(f"[code] {label}: {status} from {url}")
+        except OSError as exc:
+            if not (root / ".git").exists():
+                raise OSError(f"could not fetch {url}: {exc}") from exc
+            result.notes.append(f"{label}: could not update from {url} ({exc}); scanned the previous checkout")
+    repos[label] = list_repo_files(label, root, config.code.exclude, config.code.max_file_kb * 1024)
     return repos[label]
 
 
 def scan_code(config: Config, scope: Scope, result: ScanResult, repos: dict[str, RepoFiles], say) -> None:
     for label, root in scope.repos.items():
         try:
-            files = _repo_files(config, label, root, repos)
+            files = _repo_files(config, label, root, repos, result, say)
         except OSError as exc:
             for group in ("code.secrets", "code.python", "code.js", "code.config"):
-                result.checks.append(CheckRun(group, label, ok=False, detail=f"cannot list files: {exc}"))
+                result.checks.append(CheckRun(group, label, ok=False, detail=str(exc)))
             continue
         say(f"[code] {label}: {len(files.files)} files ({files.mode} listing)")
         if files.skipped_large:
@@ -118,9 +137,9 @@ def scan_code(config: Config, scope: Scope, result: ScanResult, repos: dict[str,
 def scan_deps(config: Config, scope: Scope, result: ScanResult, repos: dict[str, RepoFiles], osv: OsvClient, say) -> None:
     for label, root in scope.repos.items():
         try:
-            files = _repo_files(config, label, root, repos)
+            files = _repo_files(config, label, root, repos, result, say)
         except OSError as exc:
-            result.checks.append(CheckRun("deps.osv", label, ok=False, detail=f"cannot list files: {exc}"))
+            result.checks.append(CheckRun("deps.osv", label, ok=False, detail=str(exc)))
             continue
         say(f"[deps] {label}")
         run_check(result, "deps.osv", label, scan_dependencies, files, osv)
@@ -132,6 +151,7 @@ def run_scan(
     *,
     client=None,
     wrap_tool: Callable | None = None,
+    agent_command: list[str] | None = None,
     now: datetime | None = None,
     say: Callable[[str], None] = print,
 ) -> RunOutcome:
@@ -155,6 +175,7 @@ def run_scan(
         else None
     )
     repos: dict[str, RepoFiles] = {}
+    result.notes.extend(config.notes)
 
     say(f"Sentinel: scanning {config.platform}" + (" (dry run)" if options.dry_run else ""))
     if "web" in options.parts and config.web.urls:
@@ -176,6 +197,20 @@ def run_scan(
         result.agent.error = "disabled in the config"
     elif not result.findings:
         result.agent.error = "nothing to triage"
+    elif config.agent.backend == "claude-code":
+        say(f"[agent] triaging {len(result.findings)} findings with Claude Code (your Claude login)")
+        run_claude_code_agent(
+            result,
+            scope=scope,
+            repos=repos,
+            osv=osv,
+            config=config,
+            command=agent_command,
+            transcript_path=run_dir / "agent_transcript.md",
+            say=say,
+        )
+        if not result.agent.ok:
+            say(f"[agent] did not complete ({result.agent.error}); using scanner severities")
     else:
         say(f"[agent] triaging {len(result.findings)} findings with {config.agent.model}")
         run_agent(
@@ -187,6 +222,7 @@ def run_scan(
             client=client,
             wrap_tool=wrap_tool,
             transcript_path=run_dir / "agent_transcript.md",
+            skip_hosts=http.unresponsive,
             say=say,
         )
         if not result.agent.ok:

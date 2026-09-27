@@ -16,6 +16,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 
 from ..models import Finding, Severity
@@ -350,49 +351,88 @@ class OsvClient:
 # --------------------------------------------------------------------------- scan
 
 
-def _vuln_finding(label: str, pkg: Package, vuln: dict) -> Finding:
-    vid = vuln.get("id", "?")
-    cves = [a for a in vuln.get("aliases") or [] if a.startswith("CVE-")]
-    severity, basis = osv_severity(vuln)
-    fix = recommended_fix(pkg.version, fixed_versions(vuln, pkg))
+def _summary(vuln: dict) -> str:
     summary = (vuln.get("summary") or "").strip()
-    details = (vuln.get("details") or "").strip()
-    if not summary and details:
-        summary = details.split("\n", 1)[0][:140]
-    return Finding(
+    if not summary:
+        summary = (vuln.get("details") or "").strip().split("\n", 1)[0][:140]
+    return summary or vuln.get("id", "?")
+
+
+def package_finding(label: str, pkg: Package, advisories: list[dict], unfetched: list[str]) -> Finding:
+    """One finding per vulnerable package version: one upgrade usually fixes every
+    advisory, so that is the unit an administrator acts on (and is alerted about)."""
+    rated = []
+    for vuln in advisories:
+        severity, basis = osv_severity(vuln)
+        rated.append((severity, vuln, basis, recommended_fix(pkg.version, fixed_versions(vuln, pkg))))
+    rated.sort(key=lambda r: (-r[0], r[1].get("id", "")))
+    ids = [r[1].get("id", "?") for r in rated] + list(unfetched)
+    total = len(ids)
+    references = [f"https://osv.dev/vulnerability/{i}" for i in ids[:5]]
+    common = dict(
         check_id="deps.osv.vulnerable",
-        title=f"{pkg.name} {pkg.version}: {summary or vid}"[:180],
-        severity=severity,
         category="dependency",
         target=label,
         location=f"{pkg.manifest}: {pkg.spec}",
-        evidence=f"{vid}" + (f" ({', '.join(cves[:3])})" if cves else "") + f"; severity: {basis}",
-        description=(details or summary)[:900],
-        remediation=(
-            f"Upgrade {pkg.name} from {pkg.version} to {fix} or later."
-            if fix
-            else "No fixed release is listed; check the advisory for mitigations or replace the package."
-        ),
-        references=[f"https://osv.dev/vulnerability/{vid}"] + [f"https://nvd.nist.gov/vuln/detail/{c}" for c in cves[:2]],
-        key=f"{pkg.ecosystem}:{pkg.name}:{pkg.version}:{vid}",
-        confidence="firm",
+        key=f"{pkg.ecosystem}:{pkg.name}:{pkg.version}",
     )
 
+    if not rated:  # nothing could be looked up: report what OSV matched, unrated
+        return Finding(
+            title=f"{pkg.name} {pkg.version}: {total} known vulnerabilit{'y' if total == 1 else 'ies'}",
+            severity=Severity.MEDIUM,
+            evidence=", ".join(ids[:8]) + "; details not fetched (lookup budget spent or OSV unreachable)",
+            description="OSV lists this version as affected. Severities were not looked up.",
+            remediation=f"Check the advisories and upgrade {pkg.name}.",
+            references=references,
+            confidence="tentative",
+            **common,
+        )
 
-def _bare_finding(label: str, pkg: Package, vid: str) -> Finding:
+    fixes = [r[3] for r in rated if r[3]]
+    unfixed = sum(1 for r in rated if not r[3])
+    target = max(fixes, key=version_key) if fixes else None
+    if target and not unfixed and not unfetched:
+        remediation = f"Upgrade {pkg.name} from {pkg.version} to {target} or later" + (
+            f" - that release fixes all {total} advisories." if total > 1 else "."
+        )
+    elif target:
+        remediation = (
+            f"Upgrade {pkg.name} from {pkg.version} to {target} or later (fixes {len(fixes)} of {total}); "
+            "check the other advisories for mitigations."
+        )
+    else:
+        remediation = "No fixed release is listed; check the advisory for mitigations or replace the package."
+
+    if total == 1:
+        severity, vuln, basis, _fix = rated[0]
+        cves = [a for a in vuln.get("aliases") or [] if a.startswith("CVE-")]
+        return Finding(
+            title=f"{pkg.name} {pkg.version}: {_summary(vuln)}"[:180],
+            severity=severity,
+            evidence=vuln.get("id", "?") + (f" ({', '.join(cves[:3])})" if cves else "") + f"; severity: {basis}",
+            description=((vuln.get("details") or "").strip() or _summary(vuln))[:900],
+            remediation=remediation,
+            references=references + [f"https://nvd.nist.gov/vuln/detail/{c}" for c in cves[:2]],
+            confidence="firm",
+            **common,
+        )
+
+    counts = Counter(r[0].label for r in rated)
+    breakdown = ", ".join(f"{counts[s.label]} {s.label}" for s in sorted(Severity, reverse=True) if counts[s.label])
+    listed = [f"{r[1].get('id', '?')} ({r[0].label})" for r in rated] + [f"{i} (unrated)" for i in unfetched]
+    lines = [f"- [{r[0].label}] {_summary(r[1])}" for r in rated[:6]]
+    if total > 6:
+        lines.append(f"- ... and {total - 6} more")
     return Finding(
-        check_id="deps.osv.vulnerable",
-        title=f"{pkg.name} {pkg.version}: known vulnerability {vid}",
-        severity=Severity.MEDIUM,
-        category="dependency",
-        target=label,
-        location=f"{pkg.manifest}: {pkg.spec}",
-        evidence=f"{vid}; details not fetched (lookup budget spent or OSV unreachable)",
-        description="OSV lists this version as affected. Severity was not looked up.",
-        remediation=f"Check https://osv.dev/vulnerability/{vid} and upgrade {pkg.name}.",
-        references=[f"https://osv.dev/vulnerability/{vid}"],
-        key=f"{pkg.ecosystem}:{pkg.name}:{pkg.version}:{vid}",
-        confidence="tentative",
+        title=f"{pkg.name} {pkg.version}: {total} known vulnerabilities ({breakdown})",
+        severity=rated[0][0],
+        evidence=", ".join(listed[:8]) + (f", +{total - 8} more" if total > 8 else ""),
+        description="\n".join(lines),
+        remediation=remediation,
+        references=references,
+        confidence="firm",
+        **common,
     )
 
 
@@ -439,6 +479,8 @@ def scan_dependencies(repo: RepoFiles, osv: OsvClient) -> list[Finding]:
     failures: list[str] = []
     for pkg, ids in osv.query(packages).items():
         covered: set[str] = set()
+        advisories: list[dict] = []
+        unfetched: list[str] = []
         # GHSA advisories carry a severity rating: look those up first.
         for vid in sorted(ids, key=lambda i: (not i.startswith("GHSA-"), i)):
             if vid in covered:
@@ -450,15 +492,16 @@ def scan_dependencies(repo: RepoFiles, osv: OsvClient) -> list[Finding]:
                 except FetchError as exc:
                     failures.append(str(exc))
             if vuln is None:
-                out.append(_bare_finding(repo.label, pkg, vid))
+                unfetched.append(vid)
                 covered.add(vid)
                 continue
             aliases = set(vuln.get("aliases") or [])
             duplicate = bool(aliases & covered)  # e.g. PYSEC-x and GHSA-y for one issue
             covered.update([vid, *aliases])
-            if vuln.get("withdrawn") or duplicate:
-                continue
-            out.append(_vuln_finding(repo.label, pkg, vuln))
+            if not (vuln.get("withdrawn") or duplicate):
+                advisories.append(vuln)
+        if advisories or unfetched:
+            out.append(package_finding(repo.label, pkg, advisories, unfetched))
     if failures:
         raise CheckIncomplete(f"{len(failures)} advisory lookup(s) failed, so some severities are unknown; last: {failures[-1]}", out)
     return out

@@ -68,6 +68,11 @@ def cmd_doctor(args) -> int:
     _say("authorized: " + ("yes" if config.authorized else "NO - scans are refused until [platform] authorized = true"))
     for line in Scope.from_config(config).describe():
         _say(f"  scope: {line}")
+    for path, url in config.code.remotes.items():
+        state = "checked out" if (path / ".git").exists() else "cloned on the first scan"
+        _say(f"  remote: {url} ({state})")
+    for note in config.notes:
+        _say(f"  note: {note}")
 
     import shutil
 
@@ -75,7 +80,28 @@ def cmd_doctor(args) -> int:
     _say("legacy TLS probe: " + ("available" if _legacy_context() is not None else "unavailable in this OpenSSL build (check will be skipped)"))
     _say(f"dependency audit: {'on, via ' + config.deps.osv_api if config.deps.enabled else 'off'}")
 
-    if config.agent.enabled:
+    if not config.agent.enabled:
+        _say("agent: disabled in config")
+    elif config.agent.backend == "claude-code":
+        import subprocess
+
+        from .agent_cli import child_env, claude_status, find_claude
+
+        exe = find_claude(config.agent.claude_code_path)
+        if exe is None:
+            _say("agent: Claude Code backend - the `claude` CLI was NOT FOUND (install Claude Code, or set [agent] claude_code_path)")
+        else:
+            try:
+                version = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60, env=child_env()).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                version = "version unknown"
+            model = config.agent.claude_code_model or "the CLI's default model"
+            _say(f"agent: Claude Code backend - {exe} ({version or 'version unknown'}); {model}, effort {config.agent.effort}")
+            ok, status = claude_status([exe])
+            _say(f"agent login: {'ok' if ok else 'MISSING'} - {status}")
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            _say("note: ANTHROPIC_API_KEY is ignored by this backend, so your Claude login is what gets used")
+    else:
         try:
             import anthropic  # noqa: F401
 
@@ -83,12 +109,10 @@ def cmd_doctor(args) -> int:
         except ImportError:
             sdk = "anthropic NOT installed (pip install -r requirements.txt) - scans will run without AI triage"
         ok, where = credential_source()
-        _say(f"agent: {config.agent.model}, effort {config.agent.effort}; {sdk}")
+        _say(f"agent: API backend - {config.agent.model}, effort {config.agent.effort}; {sdk}")
         _say(f"agent credentials: {'found' if ok else 'MISSING'} - {where}")
         if os.environ.get("ANTHROPIC_BASE_URL"):
             _say("note: ANTHROPIC_BASE_URL is set, so API requests go to that endpoint")
-    else:
-        _say("agent: disabled in config")
 
     email = config.notify.email
     if email is None:

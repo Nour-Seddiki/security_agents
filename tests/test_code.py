@@ -9,6 +9,7 @@ from sentinel.checks.code import (
     find_secrets,
     list_repo_files,
     scan_config,
+    scan_python,
     scan_secrets,
 )
 from sentinel.models import ScanResult, Severity
@@ -116,6 +117,20 @@ class SecretScanTest(unittest.TestCase):
         text = 'API_KEY = "sk_{env}_{name}"\ndb_password = "%(DB_PASSWORD)s"\n'
         self.assertEqual(find_secrets("repo", "a.py", text), [])
 
+    def test_secret_settings_with_hardcoded_fallbacks(self):
+        text = (
+            'secret_key = os.getenv("SECRET_KEY", "dev-secret-change-me")\n'
+            'algorithm = os.getenv("ALGORITHM", "HS256")\n'
+            'password = os.environ.get("DB_PASSWORD", "")\n'
+        )
+        findings = find_secrets("repo", "app/config.py", text)
+        self.assertEqual([f.check_id for f in findings], ["code.secrets.secret_fallback"])
+        self.assertEqual(findings[0].severity, Severity.HIGH)
+        self.assertIn("fail at startup", findings[0].remediation)
+        self.assertNotIn("dev-secret-change-me", findings[0].evidence)
+        js = find_secrets("repo", "server.js", 'const secret = process.env.JWT_SECRET || "changeme123";\n')
+        self.assertEqual([f.check_id for f in js], ["code.secrets.secret_fallback_js"])
+
     def test_overlapping_rules_report_once(self):
         findings = find_secrets("repo", "settings.py", f'SECRET_KEY = "{hexs(40)}"\n')
         self.assertEqual([f.check_id for f in findings], ["code.secrets.framework_secret_key"])
@@ -143,6 +158,22 @@ class SecretScanTest(unittest.TestCase):
         self.assertEqual(first.id, moved.id)
         self.assertNotEqual(first.location, moved.location)
 
+    def test_operator_scripts_lower_code_patterns_but_not_secrets(self):
+        files = repo_files(
+            {
+                "backend/scripts/migrate.py": 'conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} TEXT"))\n',
+                "backend/scripts/deploy.py": f'TOKEN = "ghp_{hexs(36)}"\n',
+                "backend/app/api.py": 'conn.execute(text(f"SELECT * FROM t WHERE id = {user_id}"))\n',
+            }
+        )
+        result = ScanResult("t", "now", findings=scan_python(files) + scan_secrets(files))
+        baseline_triage(result)
+        by_path = {f.location.split(":")[0]: f for f in result.findings}
+        self.assertEqual(by_path["backend/scripts/migrate.py"].severity, Severity.MEDIUM)
+        self.assertIn("operator script", by_path["backend/scripts/migrate.py"].triage_note)
+        self.assertEqual(by_path["backend/app/api.py"].severity, Severity.HIGH)
+        self.assertEqual(by_path["backend/scripts/deploy.py"].severity, Severity.CRITICAL)
+
     def test_test_paths_are_lowered_one_level(self):
         files = repo_files({"tests/test_api.py": f'TOKEN = "ghp_{hexs(36)}"\n', "app/api.py": f'TOKEN = "ghp_{hexs(36)}"\n'})
         result = ScanResult("t", "now", findings=scan_secrets(files))
@@ -154,7 +185,7 @@ class SecretScanTest(unittest.TestCase):
         self.assertEqual(by_path["tests/test_api.py"].confidence, "tentative")
 
 
-PY_SAMPLE = """\
+PY_BAD = """\
 import os, pickle, subprocess, ssl, tempfile
 import jwt, requests, yaml
 from flask import render_template_string
@@ -178,6 +209,13 @@ def bad(cursor, user, host, blob, text, token, key, tpl, html):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
 
+if __name__ == "__main__":
+    app.run(debug=True)
+"""
+
+PY_FINE = """\
+import subprocess, yaml, requests
+
 def fine(cursor, user, text):
     eval("1 + 1")
     subprocess.run(["ls", "-l"])
@@ -186,26 +224,31 @@ def fine(cursor, user, text):
     cursor.execute(f"not sql {user}")
     yaml.load(text, Loader=yaml.SafeLoader)
     requests.get("https://x")
-
-if __name__ == "__main__":
-    app.run(debug=True)
 """
 
 
 class PythonRulesTest(unittest.TestCase):
-    def test_rules_fire_on_bad_code_only(self):
-        findings = analyze_python("repo", "app/views.py", PY_SAMPLE)
-        rules = [f.check_id.rsplit(".", 1)[1] for f in findings]
+    def test_rules_fire_on_bad_code(self):
+        findings = {f.check_id.rsplit(".", 1)[1]: f for f in analyze_python("repo", "app/views.py", PY_BAD)}
         expected = {
             "eval", "shell_injection", "sql_injection", "pickle", "yaml_load", "tls_verify_off",
             "jwt_no_verify", "template_injection", "mark_safe", "mktemp", "debug_server",
         }
-        self.assertEqual(set(rules), expected)
-        self.assertEqual(rules.count("sql_injection"), 3)  # f-string, % and .format
-        self.assertEqual(rules.count("shell_injection"), 2)
-        fine_start = PY_SAMPLE.splitlines().index("def fine(cursor, user, text):") + 1
-        late = [f for f in findings if int(f.location.rsplit(":", 1)[1]) > fine_start and "debug_server" not in f.check_id]
-        self.assertEqual(late, [], [f.location for f in late])
+        self.assertEqual(set(findings), expected)
+        # one finding per rule per file, listing every line
+        sql = findings["sql_injection"]
+        self.assertTrue(sql.title.endswith("(3 places)"))  # f-string, % and .format
+        self.assertEqual(sql.location, "app/views.py:10")
+        self.assertIn("also lines 11, 12", sql.evidence)
+        self.assertEqual(findings["shell_injection"].title, "Shell command built from variables (2 places)")
+
+    def test_safe_code_is_quiet(self):
+        self.assertEqual(analyze_python("repo", "app/views.py", PY_FINE), [])
+
+    def test_ids_survive_new_occurrences(self):
+        one = analyze_python("repo", "a.py", "import pickle\npickle.loads(b)\n")[0]
+        two = analyze_python("repo", "a.py", "import pickle\npickle.loads(a)\npickle.loads(b)\n")[0]
+        self.assertEqual(one.id, two.id)
 
     def test_debug_setting_only_in_settings_modules(self):
         self.assertEqual(
@@ -235,6 +278,26 @@ class JavaScriptRulesTest(unittest.TestCase):
 
     def test_regex_exec_is_not_command_injection(self):
         self.assertEqual(analyze_javascript("repo", "a.js", "const m = /a+/.exec(s + t);\n"), [])
+
+    def test_strings_inside_inline_handlers(self):
+        js = (
+            "row = `<button onclick=\"handleBanUser(${u.id}, '${escapeHtml(name)}')\">Ban</button>`;\n"
+            'ok = `<button onclick="handleBanUser(${u.id})">Ban</button>`;\n'
+        )
+        findings = analyze_javascript("repo", "admin.js", js)
+        self.assertEqual([(f.check_id, f.location) for f in findings], [("code.js.inline_handler_string", "admin.js:1")])
+        self.assertIn("escapeHtml() does not protect", findings[0].description)
+
+    def test_static_markup_is_not_dom_xss(self):
+        js = (
+            "tbody.innerHTML = '<tr><td colspan=\"5\"><div class=\"table-empty\">No users found</div></td></tr>';\n"
+            'grid.innerHTML = "<div class=\'empty\'>none</div>"; // placeholder\n'
+            "box.innerHTML = `<svg fill=\"none\">\n  <path d=\"M4 6h16\"/>\n</svg>`;\n"
+            "if (x) { el.innerHTML = ''; return; }\n"
+            "row.innerHTML = `<td>${user.name}</td>`;\n"
+        )
+        findings = analyze_javascript("repo", "admin.js", js)
+        self.assertEqual([f.location for f in findings], ["admin.js:7"], [f.evidence for f in findings])
 
 
 class ConfigRulesTest(unittest.TestCase):

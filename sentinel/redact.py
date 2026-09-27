@@ -21,6 +21,23 @@ class SecretRule:
     pattern: re.Pattern[str]
     group: int = 0  # the capture group holding the secret itself
     confidence: str = "firm"
+    # A fallback default is the problem even when it reads like "change-me": it is what
+    # runs whenever the environment variable is missing.
+    flag_placeholders: bool = False
+    description: str = ""  # overrides the generic "leaked credential" wording
+    remediation: str = ""
+
+
+_FALLBACK_WHY = (
+    "If the environment variable is ever missing - a new host, a renamed setting, a typo - the "
+    "application silently runs with this default, and anyone who has seen the code knows it: "
+    "they can forge login tokens or sign sessions."
+)
+_FALLBACK_FIX = (
+    "Remove the default and fail at startup when the variable is missing. Check that production "
+    "sets it, and rotate it if the service may ever have run on the default."
+)
+_SECRET_NAME = r"\w*(?:SECRET|PASSWORD|PASSWD|TOKEN|API_?KEY|PRIVATE_?KEY|SIGNING_?KEY)\w*"
 
 
 _NL = r"(?:\r?\n|\\n)"  # a real newline, or a literal \n inside a JSON/env string
@@ -126,6 +143,28 @@ SECRET_RULES: tuple[SecretRule, ...] = (
         Severity.HIGH,
         re.compile(r"(?i)\b[a-z][a-z0-9+.\-]{1,20}://[^\s:@/'\"`<>]{1,64}:([^\s@/'\"`<>]{3,128})@[^\s'\"`<>]+"),
         1,
+    ),
+    SecretRule(
+        "secret_fallback",
+        "Secret setting falls back to a hardcoded default",
+        Severity.HIGH,
+        re.compile(
+            r"""(?i)\b(?:getenv|environ\.get|env\.get)\(\s*["']""" + _SECRET_NAME + r"""["']\s*,\s*[rbuRBU]?["']([^"'\n]{4,})["']"""
+        ),
+        1,
+        flag_placeholders=True,
+        description=_FALLBACK_WHY,
+        remediation=_FALLBACK_FIX,
+    ),
+    SecretRule(
+        "secret_fallback_js",
+        "Secret setting falls back to a hardcoded default",
+        Severity.HIGH,
+        re.compile(r"""(?i)\bprocess\.env\.""" + _SECRET_NAME + r"""\s*(?:\|\||\?\?)\s*["'`]([^"'`\n]{4,})["'`]"""),
+        1,
+        flag_placeholders=True,
+        description=_FALLBACK_WHY,
+        remediation=_FALLBACK_FIX,
     ),
     SecretRule(
         "framework_secret_key",

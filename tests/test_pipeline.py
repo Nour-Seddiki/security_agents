@@ -1,6 +1,8 @@
 import email
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -8,12 +10,13 @@ from datetime import datetime, timedelta, timezone
 from email import policy
 from pathlib import Path
 
+from sentinel.checks.code import sync_checkout
 from sentinel.cli import main
 from sentinel.config import ConfigError, load_config
 from sentinel.demo import LocalSite, build_sample_repo, make_vulnerable_handler
 from sentinel.pipeline import EXIT_MAJOR_FINDINGS, EXIT_NOTIFY_FAILED, RunOptions, run_scan
 
-from .helpers import FakeClient, final_message, identity, osv_server, smtp_server, write_config
+from .helpers import FakeClient, final_message, hexs, identity, osv_server, smtp_server, write_config
 
 T0 = datetime(2026, 9, 1, 2, 0, tzinfo=timezone.utc)
 QUIET = lambda _line: None  # noqa: E731
@@ -144,6 +147,38 @@ class ConfigAndCliTest(unittest.TestCase):
         self.folder = Path(tempfile.mkdtemp(prefix="sentinel-cfg-"))
         (self.folder / "repo").mkdir()
 
+    def test_urls_are_normalized_and_fragments_dropped(self):
+        path = write_config(
+            self.folder,
+            urls=["https://App.example.com/#/signin", "https://app.example.com", "https://app.example.com/login?x=1"],
+        )
+        config = load_config(path)
+        self.assertEqual(config.web.urls, ["https://app.example.com/", "https://app.example.com/login?x=1"])
+        self.assertTrue(any("#/signin" in note for note in config.notes))
+
+    def test_git_urls_become_checkouts(self):
+        checkouts = self.folder / "checkouts"
+        path = write_config(self.folder, urls=["https://app.example.com/"])
+        remote_repos = (
+            "[code]\n"
+            "repos = [' https://github.com/Owner/Shop-App/tree/main/src', 'git@gitlab.com:group/api.git']\n"
+            f"checkout_dir = '{checkouts.as_posix()}'"
+        )
+        text = path.read_text(encoding="utf-8").replace("[code]\nrepos = []", remote_repos)
+        path.write_text(text, encoding="utf-8")
+        config = load_config(path)
+        self.assertEqual(
+            sorted(config.code.remotes.values()),
+            ["git@gitlab.com:group/api.git", "https://github.com/Owner/Shop-App"],  # browser URL trimmed to the repo
+        )
+        self.assertEqual(
+            sorted(p.relative_to(checkouts.resolve()).as_posix() for p in config.code.repos),
+            ["github.com/Owner/Shop-App", "gitlab.com/group/api"],
+        )
+        path.write_text(text.replace("https://github.com/Owner", "https://user:token@github.com/Owner"), encoding="utf-8")
+        with self.assertRaisesRegex(ConfigError, "credentials"):
+            load_config(path)
+
     def test_unknown_keys_and_bad_values_are_errors(self):
         path = write_config(self.folder, repos=[self.folder / "repo"], extra="\n[agent]\nefort = \"high\"\n")
         with self.assertRaisesRegex(ConfigError, "efort"):
@@ -175,6 +210,55 @@ class ConfigAndCliTest(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("authorized: yes", text)
         self.assertIn("SENTINEL_TEST_SMTP_PASSWORD", text)
+
+
+@unittest.skipUnless(shutil.which("git"), "git not installed")
+class RemoteRepoTest(unittest.TestCase):
+    def git(self, *args, cwd):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, check=True, capture_output=True)
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp(prefix="sentinel-remote-"))
+        self.source = self.folder / "source"
+        self.source.mkdir()
+        self.git("init", "-q", cwd=self.source)
+        (self.source / "app.py").write_text("print('v1')\n", encoding="utf-8")
+        self.git("add", "-A", cwd=self.source)
+        self.git("commit", "-q", "-m", "v1", cwd=self.source)
+
+    def test_clone_then_update(self):
+        dest = self.folder / "checkouts" / "source"
+        self.assertEqual(sync_checkout(str(self.source), dest), "cloned")
+        self.assertTrue((dest / "app.py").is_file())
+        (self.source / "keys.py").write_text(f'TOKEN = "ghp_{hexs(36)}"\n', encoding="utf-8")
+        self.git("add", "-A", cwd=self.source)
+        self.git("commit", "-q", "-m", "v2", cwd=self.source)
+        self.assertEqual(sync_checkout(str(self.source), dest), "updated")
+        self.assertTrue((dest / "keys.py").is_file())
+
+    def remote_config(self, dest, url):
+        config = load_config(write_config(self.folder, urls=["https://app.example.com/"]))
+        config.code.repos = [dest]
+        config.code.remotes = {dest: url}
+        return config
+
+    def test_unreachable_remote_fails_the_code_checks(self):
+        dest = (self.folder / "checkouts" / "missing").resolve()
+        config = self.remote_config(dest, str(self.folder / "does-not-exist"))
+        outcome = run_scan(config, RunOptions(dry_run=True, parts=("code",)), now=T0, say=QUIET)
+        states = {c.group: (c.state, c.detail) for c in outcome.result.checks}
+        self.assertEqual(states["code.secrets"][0], "error")
+        self.assertIn("could not fetch", states["code.secrets"][1])
+
+    def test_scan_clones_and_scans_the_remote(self):
+        (self.source / "keys.py").write_text(f'TOKEN = "ghp_{hexs(36)}"\n', encoding="utf-8")
+        self.git("add", "-A", cwd=self.source)
+        self.git("commit", "-q", "-m", "v2", cwd=self.source)
+        dest = (self.folder / "checkouts" / "source").resolve()
+        config = self.remote_config(dest, str(self.source))
+        outcome = run_scan(config, RunOptions(dry_run=True, parts=("code",)), now=T0, say=QUIET)
+        self.assertIn("code.secrets.github_token", {f.check_id for f in outcome.result.findings})
+        self.assertTrue((dest / ".git").exists())
 
 
 if __name__ == "__main__":

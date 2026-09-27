@@ -115,6 +115,28 @@ class OsvScanTest(unittest.TestCase):
         self.assertEqual(len(unpinned), 1)
         self.assertIn("flask", unpinned[0].evidence)
 
+    def test_one_finding_per_package_with_the_upgrade_that_fixes_everything(self):
+        ids = ["GHSA-p1", "GHSA-p2", "GHSA-p3"]
+        vulns = {("django", "3.2.0"): ids}
+        details = {
+            "GHSA-p1": advisory("GHSA-p1", "django", ["3.2.19"], "HIGH"),
+            "GHSA-p2": advisory("GHSA-p2", "django", ["3.2.25"], "HIGH"),
+            "GHSA-p3": advisory("GHSA-p3", "django", ["3.2.4"], "MODERATE"),
+        }
+        with osv_server(vulns, details) as osv:
+            findings = scan_dependencies(self.files, OsvClient(f"http://127.0.0.1:{osv.port}", timeout_s=5))
+        django = [f for f in findings if f.check_id == "deps.osv.vulnerable"]
+        self.assertEqual(len(django), 1)
+        f = django[0]
+        self.assertEqual(f.title, "django 3.2.0: 3 known vulnerabilities (2 high, 1 medium)")
+        self.assertEqual(f.severity, Severity.HIGH)
+        self.assertEqual(f.remediation, "Upgrade django from 3.2.0 to 3.2.25 or later - that release fixes all 3 advisories.")
+        self.assertIn("GHSA-p1 (high)", f.evidence)
+        # the id is per package version: a new advisory doesn't make it a "new" finding
+        with osv_server({("django", "3.2.0"): ids[:1]}, details) as osv:
+            again = scan_dependencies(self.files, OsvClient(f"http://127.0.0.1:{osv.port}", timeout_s=5))
+        self.assertEqual([x.id for x in again if x.check_id == "deps.osv.vulnerable"], [f.id])
+
     def test_lookup_failures_keep_what_was_found(self):
         vulns = {("django", "3.2.0"): ["GHSA-aaaa"]}
         with osv_server(vulns, {}, fail_details=True) as osv:

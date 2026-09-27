@@ -43,6 +43,25 @@ Set `PYTHONIOENCODING=utf-8` when redirecting output on Windows.
 - **Finding ids must be stable across runs**: `fingerprint(check_id, target, key or
   location)`. Put anything that drifts (line numbers, random URLs) in `location` and a
   stable identity in `key`. Alert dedup depends on it.
+- **One finding per actionable unit**: code patterns per (file, rule) with every line in
+  the evidence (`key = path:rule`); dependencies per package version with the upgrade
+  that fixes every advisory (`key = ecosystem:name:version`); exposed paths per kind.
+  Secrets stay one per occurrence (each needs its own rotation).
+- **Remote repos** (git URLs in `[code] repos`) are shallow-cloned by
+  `checks.code.sync_checkout` into `%LOCALAPPDATA%\sentinel\repos\<host>\<owner>\<repo>`,
+  off OneDrive, with `GIT_TERMINAL_PROMPT=0`. `config.code.remotes` maps checkout -> URL.
+- **Two agent backends, one contract.** `agent.run_agent` (API, tool runner) and
+  `agent_cli.run_claude_code_agent` (`claude -p` with the user's Claude login) both fill
+  `result.agent`, merge via `apply_report`/`parse_report` and never raise. The CLI one
+  runs in a temp workspace of *redacted* copies with `--tools Read,Grep,Glob --restricted
+  --safe-mode --strict-mcp-config --permission-prompts none --no-session-persistence
+  --json-schema`, and `child_env()` strips API keys and any parent Claude Code session's
+  variables (a nested `claude` otherwise misbehaves). Tests drive it with
+  `tests/fake_claude.py`, which fails unless those flags and that env are right. Both
+  backends share `agent.analyst_prompt()`; only the tools paragraph differs.
+- **`HttpClient` has a per-host breaker**: 3 transport failures in a row and the host is
+  skipped for the rest of the run (CDNs block the sensitive-path probes). The agent's
+  client inherits `unresponsive` via `run_agent(skip_hosts=...)`.
 - **Test fixtures never contain literal secrets**: build fake tokens at run time
   (`helpers.hexs`, `demo._hex`) so the repo itself stays clean for secret scanners.
 

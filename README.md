@@ -104,9 +104,26 @@ python -m sentinel test-email            # check SMTP delivery
 python -m sentinel scan                  # the real thing
 ```
 
-AI triage needs `pip install -r requirements.txt` and an `ANTHROPIC_API_KEY` (or an
-`ant auth login` profile). `python -m sentinel demo --agent` shows it on the demo;
-`--no-agent` scans without it.
+### Turning on the AI analyst
+
+Pick one backend under `[agent]`:
+
+| | `backend = "claude-code"` | `backend = "api"` |
+|---|---|---|
+| Needs | Claude Code CLI logged in with your Claude account (`claude auth login`) | `pip install -r requirements.txt` + `ANTHROPIC_API_KEY` |
+| Billing | your Pro/Max plan's usage limits | pay-as-you-go API credits |
+| Agent's tools | Read / Grep / Glob over a redacted copy of the code | files + in-scope GET requests + advisory lookups |
+
+With `claude-code`, Sentinel runs `claude -p` headless in a temporary folder that holds a
+redacted copy of the scanned files, the findings and the advisories - nothing else. The
+session is locked down with `--tools Read,Grep,Glob --restricted --safe-mode
+--strict-mcp-config --permission-prompts none --no-session-persistence`, returns the same
+JSON verdict (`--json-schema`), and the folder is deleted afterwards. `ANTHROPIC_API_KEY`
+is removed from its environment so your plan, not API credits, is used. For scheduled
+runs, `claude setup-token` creates a long-lived login in `CLAUDE_CODE_OAUTH_TOKEN`.
+
+`python -m sentinel doctor` shows which backend is active and whether it can log in.
+`--no-agent` scans without the analyst.
 
 ## Configuration
 
@@ -118,9 +135,9 @@ a typo in a security tool's config should never silently change what gets report
 |---|---|
 | `[platform]` | name, and the `authorized` confirmation |
 | `[web]` | URLs to assess, extra hosts redirects may reach, request budget, delay, timeout |
-| `[code]` | repositories to scan, exclusions, max file size |
+| `[code]` | source to scan - local folders and/or git URLs (shallow-cloned and refreshed each run) - exclusions, max file size |
 | `[deps]` | OSV.dev dependency audit (package names and versions only are sent) |
-| `[agent]` | model (`claude-opus-5`), effort, turn and HTTP budgets |
+| `[agent]` | backend (`api` or `claude-code`), model, effort, turn/HTTP budgets, timeout |
 | `[notify]` | what counts as major (`min_severity`, default `high`), reminder interval |
 | `[notify.email]` | recipients, sender, SMTP server; credentials come from environment variables |
 | `[output]` | where reports, alert state and the outbox go |
@@ -228,6 +245,25 @@ An entry in the alert email:
              every credential it contained - assume they are already known.
 ```
 
+## Troubleshooting
+
+- **"stopped responding ... the remaining requests to it were skipped".** CDNs and
+  firewalls (Netlify, Cloudflare, AWS WAF) often block a client that asks for `/.env`,
+  `/.git/HEAD` and similar paths. After three failed requests in a row Sentinel leaves
+  the host alone for the rest of the run, marks the affected checks as failed (never as
+  passed), and reports how far it got, e.g. *"checked 18 of 27 paths (0 exposed)"*. For
+  full coverage, allow-list the scanning machine's IP in the CDN/firewall or raise
+  `[web] request_delay_ms`. The block is temporary, but while it lasts the site may not
+  load from that network in a browser either.
+- **URLs with `#/route`.** Hash routes are handled in the browser; Sentinel drops the `#`
+  part and notes it (`doctor` shows the note).
+- **Private repositories.** Git URLs are cloned with prompts disabled, so a scheduled run
+  fails fast instead of hanging. Log in once with git's credential manager or use an SSH
+  URL (`git@github.com:owner/repo.git`).
+- **Many similar findings.** Code patterns are reported once per rule per file (with every
+  line listed) and dependencies once per package version (with the one upgrade that fixes
+  every advisory), so the alert reads like a to-do list rather than a log.
+
 ## Limitations
 
 - It checks *hygiene and misconfiguration*, with an AI analyst on top; it is not a
@@ -262,6 +298,7 @@ sentinel/
   net.py        scoped, budgeted HTTP client   redact.py  secret rules and redaction
   checks/       web.py  tls.py  code.py  deps.py  (+ run_check bookkeeping)
   triage.py     rule-based triage              agent.py   Claude analyst (SDK tool runner)
+  agent_cli.py  Claude analyst via the Claude Code CLI (your Claude login)
   llm.py        request shape, credentials     state.py   alert memory
   report.py     HTML / JSON / console          notify.py  SMTP email
   demo.py       deliberately vulnerable local site + sample repo

@@ -15,7 +15,7 @@ from sentinel.checks.web import (
 )
 from sentinel.demo import HardenedSite, LocalSite, SpaSite, make_vulnerable_handler
 from sentinel.models import ScanResult, Severity
-from sentinel.net import BudgetExceeded, HttpClient
+from sentinel.net import BudgetExceeded, FetchError, HttpClient
 from sentinel.scope import Origin, Scope, ScopeError
 
 
@@ -98,7 +98,8 @@ class VulnerableSiteTest(unittest.TestCase):
         http = client(self.url, max_requests=4)  # baseline + 3 probes
         run_check(result, "web.exposure", self.url, check_exposure, http, self.url.rstrip("/"))
         self.assertFalse(result.checks[0].ok)
-        self.assertIn("stopped early", result.checks[0].detail)
+        self.assertIn("checked 3 of", result.checks[0].detail)
+        self.assertIn("exposed) before stopping", result.checks[0].detail)
         self.assertIn("web.exposure.git", {f.check_id for f in result.findings})
         with self.assertRaises(BudgetExceeded):
             http.get(self.url)
@@ -149,6 +150,45 @@ class RedirectOffScopeTest(unittest.TestCase):
             run_check(result, "web.headers", site.url, check_headers, resp, site.url)
             self.assertTrue(result.checks[0].skipped)
             self.assertIn("extra_hosts", result.checks[0].detail)
+
+
+class UnresponsiveHostTest(unittest.TestCase):
+    def test_host_is_skipped_after_repeated_failures(self):
+        import socket
+        import threading
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        stop = threading.Event()
+
+        def drop_connections():  # accept, then hang up without answering - like a blocking CDN
+            listener.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                    conn.close()
+                except OSError:
+                    continue
+
+        worker = threading.Thread(target=drop_connections, daemon=True)
+        worker.start()
+        try:
+            url = f"http://127.0.0.1:{port}/"
+            http = client(url)
+            for _ in range(HttpClient.BREAKER_THRESHOLD):
+                with self.assertRaises(FetchError):
+                    http.get(url)
+            used = http.used
+            with self.assertRaisesRegex(FetchError, "stopped responding"):
+                http.get(url + ".env")
+            self.assertEqual(http.used, used)  # skipped without spending budget or time
+            self.assertIn("rate-limiting or blocking", http.notes[-1])
+        finally:
+            stop.set()
+            worker.join(2)
+            listener.close()
 
 
 class HelpersTest(unittest.TestCase):
